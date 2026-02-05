@@ -1,228 +1,168 @@
-# ============================================================
-# Advanced Time Series Forecasting with Deep Learning
-# ============================================================
+# ==============================
+# 1. INSTALL LIBRARIES
+# ==============================
+!pip install statsmodels scikit-learn tensorflow --quiet
 
-# -------------------------
-# 1. INSTALL (Run once)
-# -------------------------
-# Uncomment only if needed
-# !pip install numpy pandas scipy scikit-learn tensorflow statsmodels matplotlib
-
-# -------------------------
+# ==============================
 # 2. IMPORT LIBRARIES
-# -------------------------
+# ==============================
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-
+import tensorflow as tf
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import mean_squared_error
+import statsmodels.api as sm
 
-import tensorflow as tf
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense, Dropout
-
-from statsmodels.tsa.statespace.sarimax import SARIMAX
-
+# ==============================
+# 3. GENERATE MULTIVARIATE TIME SERIES
+# ==============================
 np.random.seed(42)
-tf.random.set_seed(42)
+t = np.arange(0, 1500)
 
-# -------------------------
-# 3. DATASET GENERATION
-# -------------------------
-T = 3000
-t = np.arange(T)
+trend = t * 0.003
+season1 = 10 * np.sin(2*np.pi*t/24)
+season2 = 5 * np.sin(2*np.pi*t/168)
+noise = np.random.normal(0, 1.5, len(t))
 
-trend = 0.0005 * t
-seasonal_daily = np.sin(2 * np.pi * t / 24)
-seasonal_weekly = 0.5 * np.sin(2 * np.pi * t / 168)
-noise = np.random.normal(0, 0.2, T)
+target = trend + season1 + season2 + noise
 
-target = trend + seasonal_daily + seasonal_weekly + noise
+lag_feature = np.roll(target, 1)
+season_feature = np.sin(2*np.pi*t/168)
+noise_feature = np.random.normal(0,1,len(t))
 
-x1 = np.roll(target, 3) + np.random.normal(0, 0.1, T)
-x2 = np.sin(2 * np.pi * t / 365)
-x3 = np.random.normal(0, 1, T)
+df = pd.DataFrame({
+    "target": target,
+    "lag_feature": lag_feature,
+    "season_feature": season_feature,
+    "noise_feature": noise_feature
+}).dropna()
 
-data = pd.DataFrame(
-    {
-        "target": target,
-        "x1": x1,
-        "x2": x2,
-        "x3": x3,
-    }
-).dropna()
-
-# -------------------------
-# 4. PREPROCESSING
-# -------------------------
+# ==============================
+# 4. NORMALIZATION
+# ==============================
 scaler = StandardScaler()
-scaled_data = scaler.fit_transform(data)
+scaled = scaler.fit_transform(df)
 
-
+# ==============================
+# 5. WINDOWING (48 → 24)
+# ==============================
 def create_sequences(data, input_len=48, output_len=24):
     X, y = [], []
-
     for i in range(len(data) - input_len - output_len):
-        X.append(data[i : i + input_len])
-        y.append(data[i + input_len : i + input_len + output_len, 0])
-
+        X.append(data[i:i+input_len])
+        y.append(data[i+input_len:i+input_len+output_len, 0])
     return np.array(X), np.array(y)
 
+X, y = create_sequences(scaled)
 
-X, y = create_sequences(scaled_data)
-
-split = int(0.8 * len(X))
-
+# ==============================
+# 6. TRAIN TEST SPLIT
+# ==============================
+split = int(0.8*len(X))
 X_train, X_test = X[:split], X[split:]
 y_train, y_test = y[:split], y[split:]
 
-# -------------------------
-# 5. LSTM MODEL
-# -------------------------
-def build_model(units=64, dropout=0.3):
-    model = Sequential(
-        [
-            LSTM(
-                units,
-                return_sequences=True,
-                input_shape=(X_train.shape[1], X_train.shape[2]),
-            ),
-            Dropout(dropout),
-            LSTM(units),
-            Dense(24),
-        ]
-    )
-
-    model.compile(optimizer="adam", loss="mse")
+# ==============================
+# 7. SEQ2SEQ LSTM MODEL
+# ==============================
+def build_model(units=64, dropout=0.2):
+    model = tf.keras.Sequential([
+        tf.keras.layers.LSTM(units, return_sequences=True, input_shape=(48,4)),
+        tf.keras.layers.Dropout(dropout),
+        tf.keras.layers.LSTM(units),
+        tf.keras.layers.Dense(24)
+    ])
+    model.compile(optimizer='adam', loss='mse')
     return model
 
+# ==============================
+# 8. GRID SEARCH
+# ==============================
+configs = [(64,0.2,32),(128,0.3,64)]
+best_loss = np.inf
 
-# -------------------------
-# 6. HYPERPARAMETER TUNING
-# -------------------------
-configs = [
-    {"units": 32, "dropout": 0.2, "batch": 32},
-    {"units": 64, "dropout": 0.3, "batch": 64},
-]
-
-best_model = None
-best_loss = float("inf")
-
-for cfg in configs:
-    model = build_model(cfg["units"], cfg["dropout"])
-
-    history = model.fit(
-        X_train,
-        y_train,
-        validation_split=0.1,
-        epochs=20,
-        batch_size=cfg["batch"],
-        verbose=0,
-    )
-
-    val_loss = min(history.history["val_loss"])
-
+for units,drop,batch in configs:
+    model = build_model(units,drop)
+    h = model.fit(X_train,y_train,epochs=10,batch_size=batch,
+                  validation_split=0.2,verbose=0)
+    val_loss = min(h.history['val_loss'])
     if val_loss < best_loss:
         best_loss = val_loss
         best_model = model
 
-# -------------------------
-# 7. BASELINE MODEL (SARIMA)
-# -------------------------
-train_series = data["target"][: split + 48]
+model = best_model
 
-sarima = SARIMAX(
-    train_series,
-    order=(1, 1, 1),
-    seasonal_order=(1, 1, 1, 24),
-).fit(disp=False)
+# ==============================
+# 9. PREDICTIONS
+# ==============================
+preds = model.predict(X_test)
 
-sarima_forecast = sarima.forecast(steps=len(y_test) * 24)
+# inverse transform only target
+y_test_inv = scaler.inverse_transform(
+    np.concatenate([y_test.reshape(-1,1),
+                    np.zeros((y_test.size,3))],axis=1)
+)[:,0].reshape(y_test.shape)
 
-# -------------------------
-# 8. EVALUATION METRICS
-# -------------------------
-def rmse(y_true, y_pred):
-    return np.sqrt(mean_squared_error(y_true, y_pred))
+preds_inv = scaler.inverse_transform(
+    np.concatenate([preds.reshape(-1,1),
+                    np.zeros((preds.size,3))],axis=1)
+)[:,0].reshape(preds.shape)
 
+# ==============================
+# 10. METRICS
+# ==============================
+rmse_lstm = np.sqrt(mean_squared_error(y_test_inv.flatten(),
+                                       preds_inv.flatten()))
 
-def mase(y_true, y_pred):
-    naive = y_true[:-1]
-    return np.mean(np.abs(y_true[1:] - y_pred[1:])) / np.mean(
-        np.abs(y_true[1:] - naive)
-    )
+naive = y_test_inv[:, :-1]
+mase_lstm = np.mean(np.abs(y_test_inv[:,1:] - preds_inv[:,1:])) / \
+            np.mean(np.abs(y_test_inv[:,1:] - naive))
 
+print("LSTM RMSE:", rmse_lstm)
+print("LSTM MASE:", mase_lstm)
 
-dl_preds = best_model.predict(X_test)
+# ==============================
+# 11. SARIMA BASELINE (MATCH HORIZON)
+# ==============================
+train_series = df['target'][:split+48]
+sarima = sm.tsa.SARIMAX(train_series,
+                       order=(1,1,1),
+                       seasonal_order=(1,1,1,24))
+sarima_model = sarima.fit(disp=False)
 
-rmse_lstm = rmse(y_test.flatten(), dl_preds.flatten())
-rmse_sarima = rmse(
-    y_test.flatten()[: len(sarima_forecast)], sarima_forecast
-)
-mase_lstm = mase(y_test.flatten(), dl_preds.flatten())
+sarima_preds = sarima_model.forecast(steps=len(y_test.flatten()))
+rmse_sarima = np.sqrt(mean_squared_error(y_test_inv.flatten(),
+                                        sarima_preds))
 
-# -------------------------
-# 9. EXPLAINABILITY (INTEGRATED GRADIENTS)
-# -------------------------
-def integrated_gradients(model, x, steps=50):
-    baseline = np.zeros_like(x)
+print("SARIMA RMSE:", rmse_sarima)
+
+# ==============================
+# 12. INTEGRATED GRADIENTS
+# ==============================
+@tf.function
+def integrated_gradients(inputs, baseline, steps=50):
+    alphas = tf.linspace(0.0,1.0,steps)
     grads = []
-
-    for i in range(steps + 1):
-        scaled = baseline + (i / steps) * (x - baseline)
-
+    for alpha in alphas:
+        x = baseline + alpha*(inputs-baseline)
         with tf.GradientTape() as tape:
-            tape.watch(scaled)
-            pred = model(scaled)
+            tape.watch(x)
+            pred = model(x)
+        grads.append(tape.gradient(pred,x))
+    avg_grads = tf.reduce_mean(tf.stack(grads),axis=0)
+    return (inputs-baseline)*avg_grads
 
-        grad = tape.gradient(pred, scaled)
-        grads.append(grad.numpy())
+baseline = tf.zeros_like(X_test[:1])
+ig = integrated_gradients(X_test[:1],baseline)
 
-    avg_grads = np.mean(grads, axis=0)
-    return (x - baseline) * avg_grads
+importance = tf.reduce_mean(tf.abs(ig),axis=[0,1])
+print("Feature importance:", importance.numpy())
 
-
-ig = integrated_gradients(best_model, X_test[:1])
-importance = np.mean(np.abs(ig), axis=(0, 1))
-
-# -------------------------
-# 10. REQUIRED TEXT OUTPUTS
-# -------------------------
-print("\nDATASET DESCRIPTION")
-print("-" * 60)
-print(
-    "Multivariate synthetic time series with trend, daily & weekly seasonality, and noise."
-)
-
-print("\nMODEL ARCHITECTURE")
-print("-" * 60)
-print("Sequence-to-sequence LSTM with dropout and dense output layer.")
-
-print("\nHYPERPARAMETER OPTIMIZATION")
-print("-" * 60)
-print("Grid search over LSTM units, dropout rate, and batch size.")
-
-print("\nFINAL PERFORMANCE METRICS")
-print("-" * 60)
-print(f"{'Model':<15}{'RMSE':<10}{'MASE':<10}")
-print("-" * 35)
-print(f"{'SARIMA':<15}{rmse_sarima:.4f}{'--':<10}")
-print(f"{'LSTM Seq2Seq':<15}{rmse_lstm:.4f}{mase_lstm:.4f}")
-
-print("\nEXPLAINABILITY FINDINGS")
-print("-" * 60)
-print(
-    "Lagged target feature has highest importance, followed by seasonal features."
-)
-
-print("\nCONCLUSION")
-print("-" * 60)
-print("LSTM outperforms SARIMA and captures meaningful temporal dependencies.")
-
-# -------------------------
-# 11. OPTIONAL PLOT
-# -------------------------
-plt.bar(["target", "x1", "x2", "x3"], importance)
-plt.title("Feature Importance (Integrated Gradients)")
-plt.show()
+# ==============================
+# 13. FINAL COMPARISON
+# ==============================
+print("\nFINAL RESULTS")
+print("LSTM RMSE:", rmse_lstm)
+print("SARIMA RMSE:", rmse_sarima)
+print("LSTM MASE:", mase_lstm)
